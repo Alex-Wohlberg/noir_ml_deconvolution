@@ -34,13 +34,13 @@ def global_admm_opitimize(y ,C, denoiser, lambda_, rho, iterations):
         # 2:GRADIENT STEP: form the new (pre-prox) x ----
         x_pre = x - rho * grad      # move to better explain the data
  
-        # 3: PROXIMAL STEP == PLUG IN THE DENOISER ----
+        # 3: Denoising Step with Difusion Model
         # prox of lambda*R has the form "denoise at strength sqrt(rho*lambda)".
-        x = denoiser(x_half, strength = sqrt(rho * lambda))
+        x = denoiser(x_half, strength = sqrt(rho * lambda)
         
-        # From my understanding:         
+        # From my understanding of prevalence of shot noise vs confusion noise         
         #   lambda too large -> prior overrides data in ambiguous blends
         #   lambda too small -> weak prior, shot noise amplifies
-        #   so your concern is about the optimzation of lamda
+        #   so concern is about the optimzation of lamda
 
     return x
