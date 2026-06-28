@@ -23,7 +23,7 @@
 # iterations: number of ADMM iterations
 #
 #
-def global_admm_opitimize(y ,C, denoiser, lambda_, rho, iterations):
+def global_admm_opitimize(y ,C, denoiser, lmbda, rho, iterations):
 	x = C.adjoint(y)   # starting guess ( assume C unitary)
 	for i in range(iterations):
 
@@ -36,7 +36,7 @@ def global_admm_opitimize(y ,C, denoiser, lambda_, rho, iterations):
  
         # 3: Denoising Step with Difusion Model
         # prox of lambda*R has the form "denoise at strength sqrt(rho*lambda)".
-        x = denoiser(x_half, strength = sqrt(rho * lambda)
+        x = denoiser(x_pre, strength = sqrt(rho * lmbda))
         
         # From my understanding of prevalence of shot noise vs confusion noise         
         #   lambda too large -> prior overrides data in ambiguous blends
@@ -44,3 +44,7 @@ def global_admm_opitimize(y ,C, denoiser, lambda_, rho, iterations):
         #   so concern is about the optimzation of lamda
 
     return x
+
+
+
+
