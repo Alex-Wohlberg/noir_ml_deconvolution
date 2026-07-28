@@ -137,9 +137,9 @@ class DiffusionProx(functional.Functional):
         # for tt in ladder[1:]:
         #     out = self._prox_op.denoise(out, t=int(tt), add_noise=False)
 
-        if it > int(50):
-            out = np.arcsinh(out)
-            out = self.lin.prox(v=snp.clip(v_np, 0, None), lam=lam/(1729.816**2))
+        if it % ((int(it/10) + 1) * 5) != 0:
+            #out = np.arcsinh(out)
+            out = self.lin.prox(v=snp.clip(v_np, 0, None), lam=lam/(1729.816**3))
 
 
         #out = self.alpha*v_np + (1.0 - self.alpha)*out
@@ -288,7 +288,9 @@ def main():
     # SCICO forward operator + L2 data fidelity (same as the reference)
     y = snp.array(y_np)
     A = linop.Convolve(h=snp.array(psf), input_shape=y_np.shape, mode="same")
-    y = A(y_np).astype(np.float32)
+    #y = A(y_np).astype(np.float32)
+    #y, key = scico.random.poisson(A(y_np)) 
+    y = y.astype(np.float32)/20.226645 #flux difference
     f = loss.SquaredL2Loss(y=y, A=A)
 
     sigmas, sig_start, sig_end = build_sigma_schedule(
@@ -344,12 +346,10 @@ def main():
         truth = load_image(args.truth).astype(np.float64)
         print(f"[result] flux(x)/flux(truth) = {x.sum()/max(truth.sum(),1e-30):.4f}")
         print(f"[result] RMSE(x, truth)      = {float(np.sqrt(np.mean((x-truth)**2))):.4e}")
-        truth = load_image(args.input).astype(np.float64)
-
     # figure
     npan = 3 if truth is not None else 2
     fig, ax = plt.subplots(1, npan + 1, figsize=(4 * (npan + 1), 4))
-    show(ax[0], A(y_np), "blurry input y")
+    show(ax[0], y, "blurry input y")
     show(ax[1], x, f"diffusion-PnP deconv\n({args.maxiter} it, anneal t={T-1}->{args.t_end})")
     if truth is not None:
         show(ax[2], truth, "true sharp")
