@@ -136,10 +136,14 @@ class DiffusionProx(functional.Functional):
         out = self._prox_op.denoise(v_np, t=int(ladder[0]))            # inject once
         # for tt in ladder[1:]:
         #     out = self._prox_op.denoise(out, t=int(tt), add_noise=False)
-
-        if it % ((int(it/10) + 1) * 5) != 0:
+        # if it > 650:
+        #         out = self.alpha*self.lin.prox(v=snp.clip(v_np, 0, None), lam=lam/((1729.816**3))) + (1 - self.alpha)*self._prox_op.denoise(v_np, t=int(ladder[0]))
+        if it % ((int(it/20) + 1) * 3) != 0:
             #out = np.arcsinh(out)
-            out = self.lin.prox(v=snp.clip(v_np, 0, None), lam=lam/(1729.816**3))
+            out = self.lin.prox(v=snp.clip(v_np , 0, None), lam=1e-12)
+    
+        # if it == 999:
+        #     out = self._prox_op.denoise(v_np, t=int(ladder[0]))
 
 
         #out = self.alpha*v_np + (1.0 - self.alpha)*out
