@@ -196,6 +196,44 @@ class Schedule:
                 x = mean
         return x
 
+    @torch.no_grad()
+    def denoise_multistep(self, model: nn.Module, x_t: torch.Tensor,
+                          t_start: int, n_steps: int = 4,
+                          eta: float = 0.0) -> torch.Tensor:
+        """Strided DDIM reverse from t_start down to 0 in n_steps jumps.
+
+        A stronger manifold projection than the one-step Tweedie estimate
+        (denoise_x0) without the cost of the full chain (denoise_from): the
+        few intermediate re-noise/denoise steps let the model correct its
+        own x0 estimate, which concentrates blurry point-source blobs toward
+        the sharp delta-like structure the prior was trained on. eta=0 is
+        deterministic DDIM (a clean, repeatable prox); eta>0 injects
+        ancestral noise. Cost: n_steps forward passes per prox call.
+        """
+        if t_start <= 0:
+            return self.denoise_x0(model, x_t, 0)
+        # respaced grid t_start -> 0 inclusive (unique, descending)
+        grid = np.unique(np.linspace(0, t_start, n_steps + 1).astype(int))[::-1]
+        x = x_t
+        for j in range(len(grid)):
+            t_cur = int(grid[j])
+            t_nxt = int(grid[j + 1]) if j + 1 < len(grid) else -1
+            tt = torch.full((x.shape[0],), t_cur, device=x.device, dtype=torch.long)
+            eps = model(x, tt)
+            ab_t = self.alpha_bars[t_cur]
+            x0 = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()
+            if t_nxt < 0:
+                x = x0
+                break
+            ab_n = self.alpha_bars[t_nxt]
+            sigma = (eta * ((1 - ab_n) / (1 - ab_t)).sqrt()
+                     * (1 - ab_t / ab_n).sqrt())
+            dir_coeff = (1 - ab_n - sigma ** 2).clamp(min=0).sqrt()
+            x = ab_n.sqrt() * x0 + dir_coeff * eps
+            if eta > 0:
+                x = x + sigma * torch.randn_like(x)
+        return x
+
     def sigma_to_t(self, sigma_model: float) -> int:
         """Timestep whose marginal noise level best matches sigma_model.
 
@@ -240,10 +278,17 @@ class AsinhProx:
     """
 
     def __init__(self, model: nn.Module, schedule: Schedule,
-                 transform: AsinhTransform):
+                 transform: AsinhTransform, n_steps: int = 1,
+                 eta: float = 0.0):
         self.model = model
         self.schedule = schedule
         self.transform = transform
+        # n_steps == 1: one-step Tweedie (denoise_x0), cheap but a weak
+        # projection that leaves blurry blobs. n_steps > 1: strided DDIM
+        # (denoise_multistep), a stronger projection that sharpens point
+        # sources -- n_steps forward passes per prox call.
+        self.n_steps = int(n_steps)
+        self.eta = float(eta)
 
     @torch.no_grad()
     def __call__(self, x_flux: torch.Tensor, sigma_flux: float) -> torch.Tensor:
@@ -254,13 +299,17 @@ class AsinhProx:
             abar = self.schedule.alpha_bars[t]
             noise = torch.randn_like(x)
             x_t = abar.sqrt() * x + (1 - abar).sqrt() * noise  # on-distribution
-            x = self.schedule.denoise_x0(self.model, x_t, t)
+            if self.n_steps > 1:
+                x = self.schedule.denoise_multistep(
+                    self.model, x_t, t, n_steps=self.n_steps, eta=self.eta)
+            else:
+                x = self.schedule.denoise_x0(self.model, x_t, t)
 
         # Clamp to the trained range before inverting: sinh explodes beyond
         # it, and the denoiser output is not intrinsically bounded. Values
         # outside [net_floor, net_ceil] are outside the training
         # distribution anyway -- pinning them is the correct prior behavior.
-        x = x.clamp(self.transform.net_floor, self.transform.net_ceil)
+        #x = x.clamp(self.transform.net_floor, self.transform.net_ceil)
         return self.transform.net_to_flux(x)
 
 
@@ -294,7 +343,7 @@ class StarPatchDataset(Dataset):
                  transform: AsinhTransform = None, image_size: int = 64,
                  b_factor: float = 1.5, pct: float = 99.9,
                  derive_sample: int = 4000, max_patches: int = None,
-                 net_scale: float = 0.20):
+                 net_scale: float = 0.20, z_ceil: float = 1.45):
         import gc
 
         self.image_size = image_size
@@ -319,7 +368,7 @@ class StarPatchDataset(Dataset):
                                        max_files=derive_sample, seed=0)
             self.transform = AsinhTransform.derive(
                 sharp_s, blurry_s, b_factor=b_factor, pct=pct,
-                net_scale=net_scale
+                net_scale=net_scale, z_ceil=z_ceil
             )
             del blurry_s, sharp_s
             gc.collect()
@@ -413,6 +462,107 @@ class StarPatchDataset(Dataset):
 
 # Training
 
+# ----------------------------------------------------------------------------
+# Training machinery for long runs
+# ----------------------------------------------------------------------------
+class EMA:
+    """Exponential moving average of weights.
+
+    Standard practice for diffusion models and usually the single largest
+    quality gain on a long run: the raw SGD iterate keeps rattling around
+    the optimum, while the average settles into it. Sampling/denoising
+    quality from EMA weights is typically much better than from the live
+    weights, and the gap grows with training length.
+    """
+
+    def __init__(self, model, decay=0.9999):
+        self.decay = float(decay)
+        self.shadow = {k: v.detach().clone().float()
+                       for k, v in model.state_dict().items()
+                       if v.dtype.is_floating_point}
+        self.buffers = {k: v.detach().clone()
+                        for k, v in model.state_dict().items()
+                        if not v.dtype.is_floating_point}
+
+    @torch.no_grad()
+    def update(self, model, step=None):
+        # warm up the decay so early averages are not dominated by the
+        # random init: d = min(decay, (1+step)/(10+step))
+        d = self.decay
+        if step is not None:
+            d = min(d, (1.0 + step) / (10.0 + step))
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+            else:
+                self.buffers[k] = v.detach().clone()
+
+    def state_dict(self):
+        out = {k: v.clone() for k, v in self.shadow.items()}
+        out.update({k: v.clone() for k, v in self.buffers.items()})
+        return out
+
+
+def lr_at(step, total_steps, base_lr, warmup, schedule="cosine"):
+    """Linear warmup then cosine decay to 5% of base_lr."""
+    if step < warmup:
+        return base_lr * (step + 1) / max(warmup, 1)
+    if schedule != "cosine":
+        return base_lr
+    prog = (step - warmup) / max(total_steps - warmup, 1)
+    prog = min(max(prog, 0.0), 1.0)
+    return base_lr * (0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * prog)))
+
+
+# ----------------------------------------------------------------------------
+# PnP-oriented training objective
+# ----------------------------------------------------------------------------
+def sample_timesteps(n: int, T: int, low_frac: float, low_max: int,
+                     device) -> torch.Tensor:
+    """Mixture t-sampling: with prob low_frac draw t ~ U[0, low_max), else
+    t ~ U[0, T). Plain uniform sampling spends only ~25% of steps in the
+    t<=75 regime where the PnP prox actually operates; the low-t component
+    concentrates training there while the uniform component keeps the full
+    range covered (the model must still handle every temperature)."""
+    t_all = torch.randint(0, T, (n,), device=device)
+    t_low = torch.randint(0, max(low_max, 1), (n,), device=device)
+    pick = torch.rand(n, device=device) < low_frac
+    return torch.where(pick, t_low, t_all)
+
+
+def diffusion_loss(model, schedule, x0, args, net_ceil: float):
+    """eps-prediction MSE with two PnP-oriented modifications.
+
+    identity_frac: that fraction of the batch gets noise = 0, so
+      x_t = sqrt(abar)*x0 and the target eps is exactly ZERO. This trains
+      the fixed-point property the PnP regularizer needs: applied to a
+      clean star field, the denoiser should do (almost) nothing, so that
+      x - D(x) measures distance from the star-field manifold instead of
+      dragging on-manifold images around (the blob mechanism: the one-step
+      posterior mean at high t erased point sources).
+
+    bright_weight: per-pixel loss weight ramping 1 -> 1+bright_weight from
+      background (net -1) to the ceiling. Counteracts the asinh compression
+      at the bright end (a whole flux DECADE occupies ~25% of net range),
+      which otherwise makes peak errors nearly free -- the peak-suppression
+      half of the blobbing.
+    """
+    device = x0.device
+    n = x0.shape[0]
+    t = sample_timesteps(n, schedule.timesteps, args.low_t_frac,
+                         args.low_t_max, device)
+    noise = torch.randn_like(x0)
+    if args.identity_frac > 0:
+        idm = torch.rand(n, device=device) < args.identity_frac
+        noise[idm] = 0.0                       # clean input -> target eps 0
+    x_t = schedule.q_sample(x0, t, noise)
+    err = (model(x_t, t) - noise) ** 2
+    if args.bright_weight > 0:
+        w = 1.0 + args.bright_weight * (x0 + 1.0).clamp(min=0) / (net_ceil + 1.0)
+        return (w * err).sum() / w.sum()
+    return err.mean()
+
+
 def train(args):
     device = get_device()
     print(f"Device: {device}")
@@ -425,11 +575,20 @@ def train(args):
         image_size = 64
         transform = (AsinhTransform.load(args.transform_json)
                      if args.transform_json else None)
+        if transform is not None and abs(transform.z_ceil - args.z_ceil) > 1e-9:
+            # Old JSONs carry z_ceil=1.05 (flux ceiling 3.3e-2), which CLIPS
+            # the brightest stars: 0.0024% of pixels but 28.6% of the flux.
+            # The prox then saturates on exactly the sources the data term
+            # fights hardest for -> blobbing. Override to the requested
+            # ceiling (default 1.45 covers the brightest sharp pixel, 0.955).
+            print(f"[transform] overriding z_ceil {transform.z_ceil} -> "
+                  f"{args.z_ceil} (b, A, floor unchanged)")
+            transform.z_ceil = float(args.z_ceil)
         dataset = StarPatchDataset(
             args.data_dir, blurry_dir=args.blurry_dir, transform=transform,
             image_size=image_size, b_factor=args.b_factor,
             derive_sample=args.derive_sample, max_patches=args.max_patches,
-            net_scale=args.net_scale,
+            net_scale=args.net_scale, z_ceil=args.z_ceil,
         )
         transform_dict = dataset.transform.to_dict()
         # persist next to the checkpoint so PnP/eval can load one shared copy
@@ -437,17 +596,49 @@ def train(args):
         dataset.transform.save(tpath)
         print(f"Saved transform constants to {tpath}")
 
+    # held-out split so a long run can be judged on generalization rather
+    # than train loss (and the best checkpoint chosen honestly)
+    val_loader = None
+    if args.val_frac > 0 and len(dataset) > 100:
+        n_val = max(1, int(len(dataset) * args.val_frac))
+        n_tr = len(dataset) - n_val
+        g = torch.Generator().manual_seed(0)
+        train_set, val_set = torch.utils.data.random_split(
+            dataset, [n_tr, n_val], generator=g)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size,
+                                shuffle=False, num_workers=args.num_workers)
+        print(f"Split: {n_tr} train / {n_val} val patches")
+    else:
+        train_set = dataset
+
     loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
+        train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, drop_last=True,
+        persistent_workers=args.num_workers > 0,
+        pin_memory=(device.type == "cuda"),
     )
 
-    model = FlatCNN(in_channels=1, base=args.base, t_dim=128).to(device)
+    dil = tuple(int(v) for v in args.dilations.split(",")) if args.dilations \
+        else (1, 2, 3, 4, 4, 3, 2, 1)
+    model = FlatCNN(in_channels=1, base=args.base, t_dim=128,
+                    dilations=dil).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"FlatCNN parameters: {n_params/1e6:.2f}M")
+    rf = 1 + 2 * sum(dil)
+    print(f"FlatCNN parameters: {n_params/1e6:.2f}M   "
+          f"dilations={dil}  receptive field={rf}px")
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
 
     schedule = Schedule(timesteps=args.timesteps, device=device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # net-space ceiling for the bright-pixel loss ramp (stars only; MNIST
+    # lives in [-1, 1] so its ceiling is 1)
+    net_ceil = (dataset.transform.net_ceil if transform_dict is not None
+                else 1.0)
+    print(f"Objective: low_t_frac={args.low_t_frac} (low_t_max={args.low_t_max}), "
+          f"identity_frac={args.identity_frac}, "
+          f"bright_weight={args.bright_weight}, net_ceil={net_ceil:.2f}")
 
     if args.overfit_one_batch:
         # Standard first sanity check: loss should approach ~0.
@@ -455,10 +646,7 @@ def train(args):
         x0 = x0.to(device)
         print("Overfitting one batch...")
         for step in range(args.overfit_steps):
-            t = torch.randint(0, schedule.timesteps, (x0.shape[0],), device=device)
-            noise = torch.randn_like(x0)
-            x_t = schedule.q_sample(x0, t, noise)
-            loss = F.mse_loss(model(x_t, t), noise)
+            loss = diffusion_loss(model, schedule, x0, args, net_ceil)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -466,36 +654,93 @@ def train(args):
                 print(f"  step {step:5d}  loss {loss.item():.6f}")
         return
 
+    ema = EMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    amp_on = args.amp and device.type == "cuda"
+    total_steps = args.epochs * max(len(loader), 1)
+    print(f"Training: {args.epochs} epochs x {len(loader)} steps = "
+          f"{total_steps} steps | EMA={args.ema_decay} | amp={amp_on} | "
+          f"warmup={args.warmup_steps} | grad_clip={args.grad_clip}")
+
+    def build_cfg():
+        return {
+            "base": args.base,
+            "timesteps": args.timesteps,
+            "image_size": image_size,
+            "dataset": args.dataset,
+            "transform": transform_dict,
+            "dilations": list(dil),
+            # PnP-oriented objective settings (for the record)
+            "low_t_frac": args.low_t_frac,
+            "low_t_max": args.low_t_max,
+            "identity_frac": args.identity_frac,
+            "bright_weight": args.bright_weight,
+        }
+
+    def save(path, extra=None):
+        blob = {"model": model.state_dict(), "config": build_cfg()}
+        if ema is not None:
+            blob["ema"] = ema.state_dict()
+        if extra:
+            blob.update(extra)
+        torch.save(blob, path)
+
+    gstep = 0
+    best_val = float("inf")
+    best_path = os.path.splitext(args.out)[0] + "_best.pt"
     for epoch in range(args.epochs):
         model.train()
         running, n_batches = 0.0, 0
         for x0, _ in loader:
-            x0 = x0.to(device)
-            t = torch.randint(0, schedule.timesteps, (x0.shape[0],), device=device)
-            noise = torch.randn_like(x0)
-            x_t = schedule.q_sample(x0, t, noise)
-            loss = F.mse_loss(model(x_t, t), noise)
-            opt.zero_grad()
+            x0 = x0.to(device, non_blocking=True)
+            if args.channels_last:
+                x0 = x0.to(memory_format=torch.channels_last)
+            for gp in opt.param_groups:
+                gp["lr"] = lr_at(gstep, total_steps, args.lr,
+                                 args.warmup_steps, args.lr_schedule)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
+                loss = diffusion_loss(model, schedule, x0, args, net_ceil)
+            opt.zero_grad(set_to_none=True)
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                               args.grad_clip)
             opt.step()
+            if ema is not None:
+                ema.update(model, step=gstep)
             running += loss.item()
             n_batches += 1
-        print(f"epoch {epoch+1:3d}/{args.epochs}  mean loss {running/n_batches:.6f}")
+            gstep += 1
 
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "config": {
-                    "base": args.base,
-                    "timesteps": args.timesteps,
-                    "image_size": image_size,
-                    "dataset": args.dataset,
-                    "transform": transform_dict,
-                },
-            },
-            args.out,
-        )
+        msg = (f"epoch {epoch+1:3d}/{args.epochs}  "
+               f"train {running/max(n_batches,1):.6f}")
+
+        # ---- validation (uses a FIXED seed so epochs are comparable) ----
+        if val_loader is not None and (epoch + 1) % args.val_every == 0:
+            model.eval()
+            vsum, vn = 0.0, 0
+            with torch.no_grad():
+                torch.manual_seed(1234)
+                for xv, _ in val_loader:
+                    xv = xv.to(device, non_blocking=True)
+                    vsum += diffusion_loss(model, schedule, xv, args,
+                                           net_ceil).item()
+                    vn += 1
+            vloss = vsum / max(vn, 1)
+            msg += f"  val {vloss:.6f}"
+            if vloss < best_val:
+                best_val = vloss
+                save(best_path, {"epoch": epoch + 1, "val_loss": vloss})
+                msg += "  <- best"
+        print(msg, flush=True)
+
+        save(args.out, {"epoch": epoch + 1})
     print(f"Saved checkpoint to {args.out}")
+    if val_loader is not None:
+        print(f"Best-by-validation checkpoint: {best_path} "
+              f"(val {best_val:.6f})")
+    if ema is not None:
+        print("Checkpoints contain BOTH 'model' and 'ema' weights; "
+              "inference prefers 'ema'.")
 
 
 # Sampling / visual sanity check
@@ -561,6 +806,53 @@ def main():
     p.add_argument("--derive-sample", type=int, default=4000,
                    help="Number of patches sampled per domain when deriving "
                         "transform constants (memory guard)")
+    p.add_argument("--z-ceil", type=float, default=1.45,
+                   help="asinh clip ceiling in z. 1.45 -> flux ceiling 1.85, "
+                        "covering the brightest sharp pixel (0.955). The old "
+                        "1.05 clipped 28.6%% of total flux into saturation, "
+                        "making the prox blob the brightest sources.")
+    p.add_argument("--low-t-frac", type=float, default=0.5,
+                   help="fraction of training draws taken from the LOW-t "
+                        "range [0, low-t-max) -- the noise levels the PnP "
+                        "prox actually operates at. The rest are uniform "
+                        "over all T (wide coverage).")
+    p.add_argument("--low-t-max", type=int, default=75,
+                   help="upper end of the emphasized low-noise range")
+    p.add_argument("--identity-frac", type=float, default=0.15,
+                   help="fraction of draws trained with ZERO noise and "
+                        "target eps=0: teaches the denoiser to leave clean "
+                        "star fields untouched (the PnP fixed-point / "
+                        "'distance to manifold' property).")
+    p.add_argument("--bright-weight", type=float, default=4.0,
+                   help="extra loss weight on bright pixels, ramping 1 -> "
+                        "1+w from background to ceiling; counteracts asinh "
+                        "peak compression (peak-suppression blobbing). "
+                        "0 disables.")
+    # -- long-run training machinery -----------------------------------------
+    p.add_argument("--ema-decay", type=float, default=0.9999,
+                   help="EMA decay for the averaged weights (0 disables). "
+                        "Usually the single biggest quality gain on a long "
+                        "run; inference prefers these weights.")
+    p.add_argument("--warmup-steps", type=int, default=1000,
+                   help="linear LR warmup steps before the cosine decay")
+    p.add_argument("--lr-schedule", choices=["cosine", "none"],
+                   default="cosine")
+    p.add_argument("--grad-clip", type=float, default=1.0,
+                   help="gradient-norm clip (0 disables)")
+    p.add_argument("--amp", action="store_true",
+                   help="bfloat16 autocast on CUDA (faster, lets you go wider)")
+    p.add_argument("--channels-last", action="store_true",
+                   help="channels_last memory format (faster convs on CUDA)")
+    p.add_argument("--val-frac", type=float, default=0.02,
+                   help="held-out fraction for validation (0 disables); the "
+                        "best-by-val checkpoint is saved as <out>_best.pt")
+    p.add_argument("--val-every", type=int, default=1,
+                   help="run validation every N epochs")
+    p.add_argument("--dilations", type=str, default=None,
+                   help="comma-separated dilation pattern, e.g. "
+                        "'1,2,3,4,6,8,8,6,4,3,2,1'. More/larger entries = "
+                        "deeper net and wider receptive field "
+                        "(RF = 1 + 2*sum). Default '1,2,3,4,4,3,2,1' -> 41px.")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=2e-4)
