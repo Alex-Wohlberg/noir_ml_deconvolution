@@ -30,6 +30,10 @@ Usage examples:
       --data-dir /home/alex/noir_ml/mycode/patches/sharp/fits \
       --epochs 100 --out flat_cnn_stars.pt
 
+  # resume a run that hit the queue walltime (same command + --resume auto)
+  python flat_cnn_diffusion.py --dataset stars --data-dir ... \
+      --epochs 400 --out flat_cnn_stars_v3.pt --resume auto
+
   # sample from a trained checkpoint
   python flat_cnn_diffusion.py --dataset stars --data-dir ... \
       --sample-only --ckpt flat_cnn_stars.pt
@@ -502,6 +506,27 @@ class EMA:
         out.update({k: v.clone() for k, v in self.buffers.items()})
         return out
 
+    @torch.no_grad()
+    def load_state_dict(self, sd):
+        """Restore averaged weights from a checkpoint blob's 'ema' entry.
+
+        Needed for --resume: without this the EMA restarts from the live
+        weights at resume time, discarding the average accumulated over
+        every prior epoch -- which is the weight set inference actually
+        uses, so losing it silently degrades the model you ship.
+        """
+        missing = [k for k in self.shadow if k not in sd]
+        if missing:
+            raise RuntimeError(
+                f"EMA checkpoint is missing {len(missing)} tensor(s), first "
+                f"few: {missing[:5]}. Architecture flags probably differ from "
+                f"the run being resumed (--base / --dilations).")
+        for k, v in sd.items():
+            if k in self.shadow:
+                self.shadow[k].copy_(v.to(self.shadow[k].device).float())
+            else:
+                self.buffers[k] = v.clone()
+
 
 def lr_at(step, total_steps, base_lr, warmup, schedule="cosine"):
     """Linear warmup then cosine decay to 5% of base_lr."""
@@ -563,9 +588,63 @@ def diffusion_loss(model, schedule, x0, args, net_ceil: float):
     return err.mean()
 
 
+# ----------------------------------------------------------------------------
+# Resume helpers
+# ----------------------------------------------------------------------------
+# Architecture / schedule flags that MUST match between a checkpoint and the
+# run resuming it. Objective knobs (bright_weight, low_t_frac, ...) are
+# deliberately excluded: changing those mid-run is unusual but legitimate,
+# and it does not invalidate the optimizer state.
+_RESUME_CRITICAL_KEYS = ("base", "dilations", "timesteps", "image_size",
+                         "dataset")
+
+
+def _check_resume_compatible(saved_cfg: dict, live_cfg: dict) -> None:
+    """Fail loudly on a mismatch rather than half-loading a wrong model."""
+    bad = []
+    for k in _RESUME_CRITICAL_KEYS:
+        old, new = saved_cfg.get(k), live_cfg.get(k)
+        if old is not None and new is not None and old != new:
+            bad.append(f"  {k}: checkpoint={old!r}  current={new!r}")
+    if bad:
+        raise RuntimeError(
+            "Cannot resume: architecture/schedule flags differ from the "
+            "checkpoint.\n" + "\n".join(bad) +
+            "\nEither match the original flags or start a fresh run with a "
+            "new --out path.")
+
+    # Transform constants define the space the weights were trained in. A
+    # silent drift here (re-derived from a different patch subsample, or a
+    # different --net-scale / --z-ceil) would poison every subsequent epoch
+    # without raising anything, so it is checked explicitly.
+    told, tnew = saved_cfg.get("transform"), live_cfg.get("transform")
+    if told is not None and tnew is not None:
+        drift = [k for k in told
+                 if isinstance(told[k], (int, float))
+                 and isinstance(tnew.get(k), (int, float))
+                 and not math.isclose(float(told[k]), float(tnew[k]),
+                                      rel_tol=1e-6, abs_tol=0.0)]
+        if drift:
+            raise RuntimeError(
+                f"Cannot resume: transform constants changed ({', '.join(drift)}). "
+                f"Pass --transform-json <out>_transform.json so the resumed run "
+                f"uses the frozen constants the weights were trained with.")
+
+
 def train(args):
     device = get_device()
     print(f"Device: {device}")
+
+    # --- resolve the resume target before anything else touches the data ---
+    resume_path = args.resume
+    if resume_path == "auto":
+        resume_path = args.out if os.path.exists(args.out) else None
+        if resume_path:
+            print(f"[resume] auto-detected checkpoint at {resume_path}")
+        else:
+            print(f"[resume] auto: no checkpoint at {args.out}, starting fresh")
+    elif resume_path and not os.path.exists(resume_path):
+        raise FileNotFoundError(f"--resume checkpoint not found: {resume_path}")
 
     if args.dataset == "mnist":
         image_size = 32
@@ -573,8 +652,15 @@ def train(args):
         transform_dict = None
     else:
         image_size = 64
-        transform = (AsinhTransform.load(args.transform_json)
-                     if args.transform_json else None)
+        tpath = os.path.splitext(args.out)[0] + "_transform.json"
+        # On resume, prefer the frozen constants written by the original run.
+        # Re-deriving them from a fresh subsample would shift the space the
+        # existing weights live in.
+        tjson = args.transform_json
+        if resume_path and tjson is None and os.path.exists(tpath):
+            print(f"[resume] loading frozen transform constants from {tpath}")
+            tjson = tpath
+        transform = AsinhTransform.load(tjson) if tjson else None
         if transform is not None and abs(transform.z_ceil - args.z_ceil) > 1e-9:
             # Old JSONs carry z_ceil=1.05 (flux ceiling 3.3e-2), which CLIPS
             # the brightest stars: 0.0024% of pixels but 28.6% of the flux.
@@ -592,7 +678,6 @@ def train(args):
         )
         transform_dict = dataset.transform.to_dict()
         # persist next to the checkpoint so PnP/eval can load one shared copy
-        tpath = os.path.splitext(args.out)[0] + "_transform.json"
         dataset.transform.save(tpath)
         print(f"Saved transform constants to {tpath}")
 
@@ -669,6 +754,11 @@ def train(args):
             "dataset": args.dataset,
             "transform": transform_dict,
             "dilations": list(dil),
+            # planned schedule length: lr_at() is a function of total_steps,
+            # so resuming with a different --epochs silently rescales the
+            # cosine decay. Recorded here so resume can warn about it.
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
             # PnP-oriented objective settings (for the record)
             "low_t_frac": args.low_t_frac,
             "low_t_max": args.low_t_max,
@@ -680,14 +770,84 @@ def train(args):
         blob = {"model": model.state_dict(), "config": build_cfg()}
         if ema is not None:
             blob["ema"] = ema.state_dict()
+        # --- resume state -------------------------------------------------
+        # Weights alone are not enough to continue a run: AdamW's moment
+        # estimates take thousands of steps to rebuild, and lr_at() is a
+        # function of gstep, so a naive restart replays the warmup on an
+        # already-converged model.
+        blob["optimizer"] = opt.state_dict()
+        blob["gstep"] = gstep
+        blob["best_val"] = best_val
+        blob["rng_state"] = torch.get_rng_state()
+        if torch.cuda.is_available():
+            blob["cuda_rng_state"] = torch.cuda.get_rng_state_all()
         if extra:
             blob.update(extra)
-        torch.save(blob, path)
+        # Atomic write: a 48-hour job killed mid-torch.save() would
+        # otherwise leave a truncated file where the checkpoint used to be,
+        # destroying the previous epoch's good copy along with it.
+        tmp = path + ".tmp"
+        torch.save(blob, tmp)
+        os.replace(tmp, path)
 
     gstep = 0
     best_val = float("inf")
+    start_epoch = 0
     best_path = os.path.splitext(args.out)[0] + "_best.pt"
-    for epoch in range(args.epochs):
+
+    if resume_path:
+        ck = torch.load(resume_path, map_location=device, weights_only=False)
+        _check_resume_compatible(ck.get("config", {}), build_cfg())
+
+        model.load_state_dict(ck["model"])
+        if ema is not None:
+            if "ema" in ck:
+                ema.load_state_dict(ck["ema"])
+            else:
+                print("[resume] WARNING: checkpoint has no EMA weights; the "
+                      "average restarts from the current live weights.")
+        if "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+        else:
+            print("[resume] WARNING: checkpoint predates optimizer saving; "
+                  "AdamW moments restart from zero (expect a transient loss "
+                  "bump over the first few hundred steps).")
+        start_epoch = int(ck.get("epoch", 0))
+        gstep = int(ck.get("gstep", start_epoch * max(len(loader), 1)))
+        best_val = float(ck.get("best_val", float("inf")))
+
+        # RNG restore keeps the noise/shuffle stream continuous across the
+        # job boundary. Best-effort: a checkpoint moved between machines can
+        # carry a CUDA state with a different device count.
+        if "rng_state" in ck:
+            try:
+                torch.set_rng_state(ck["rng_state"].cpu().to(torch.uint8))
+                if "cuda_rng_state" in ck and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(ck["cuda_rng_state"])
+            except Exception as e:      # noqa: BLE001 - non-fatal by design
+                print(f"[resume] could not restore RNG state ({e}); "
+                      f"continuing with a fresh stream.")
+
+        saved_epochs = ck.get("config", {}).get("epochs")
+        if saved_epochs is not None and saved_epochs != args.epochs:
+            print(f"[resume] WARNING: original run planned {saved_epochs} "
+                  f"epochs, this one plans {args.epochs}. The cosine LR "
+                  f"schedule is defined over total_steps, so the decay curve "
+                  f"has changed shape mid-run.")
+
+        if start_epoch >= args.epochs:
+            print(f"[resume] checkpoint is already at epoch {start_epoch} of "
+                  f"{args.epochs} -- nothing to do. Raise --epochs to train "
+                  f"further.")
+            return
+
+        print(f"[resume] continuing from epoch {start_epoch + 1}/{args.epochs} "
+              f"| gstep={gstep} | best_val={best_val:.6f}"
+              if best_val < float("inf") else
+              f"[resume] continuing from epoch {start_epoch + 1}/{args.epochs} "
+              f"| gstep={gstep} | no validation history")
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         running, n_batches = 0.0, 0
         for x0, _ in loader:
@@ -718,6 +878,13 @@ def train(args):
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
             model.eval()
             vsum, vn = 0.0, 0
+            # Save/restore the RNG around the fixed seed. Without this,
+            # manual_seed(1234) leaves the global stream at the same state
+            # after every validation, so each post-validation epoch replays
+            # an identical noise sequence.
+            rng_state = torch.get_rng_state()
+            cuda_rng = (torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available() else None)
             with torch.no_grad():
                 torch.manual_seed(1234)
                 for xv, _ in val_loader:
@@ -725,6 +892,9 @@ def train(args):
                     vsum += diffusion_loss(model, schedule, xv, args,
                                            net_ceil).item()
                     vn += 1
+            torch.set_rng_state(rng_state)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
             vloss = vsum / max(vn, 1)
             msg += f"  val {vloss:.6f}"
             if vloss < best_val:
@@ -746,9 +916,11 @@ def train(args):
 # Sampling / visual sanity check
 def sample(args):
     device = get_device()
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     cfg = ckpt["config"]
-    model = FlatCNN(in_channels=1, base=cfg["base"], t_dim=128).to(device)
+    dil = tuple(cfg.get("dilations") or (1, 2, 3, 4, 4, 3, 2, 1))
+    model = FlatCNN(in_channels=1, base=cfg["base"], t_dim=128,
+                    dilations=dil).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -848,6 +1020,13 @@ def main():
                         "best-by-val checkpoint is saved as <out>_best.pt")
     p.add_argument("--val-every", type=int, default=1,
                    help="run validation every N epochs")
+    p.add_argument("--resume", type=str, default=None, metavar="PATH|auto",
+                   help="Continue a previous run: restores weights, EMA, "
+                        "AdamW moments, global step, best-val and RNG state "
+                        "from PATH. 'auto' resumes from --out if it exists "
+                        "and starts fresh otherwise -- use that in a Slurm "
+                        "script so the same submission works for the first "
+                        "job and every continuation.")
     p.add_argument("--dilations", type=str, default=None,
                    help="comma-separated dilation pattern, e.g. "
                         "'1,2,3,4,6,8,8,6,4,3,2,1'. More/larger entries = "
@@ -879,6 +1058,8 @@ def main():
         if args.blurry_dir is None and args.transform_json is None:
             p.error("stars training needs --blurry-dir (to derive the asinh "
                     "transform) or --transform-json (to load frozen constants)")
+    if args.overfit_one_batch and args.resume:
+        p.error("--resume is meaningless with --overfit-one-batch")
     if args.sample_only:
         if args.ckpt is None:
             p.error("--ckpt is required with --sample-only")
