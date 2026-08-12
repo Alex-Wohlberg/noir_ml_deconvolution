@@ -59,11 +59,13 @@ estimate to [0,1] in normalized units before inverting -- the asinh inverse is
 explosive (normalized 1.2 -> 14x flux error, 2.0 -> inf in float32).
 
 Usage:
-  python admm_diffusion_deconvolve.py \
-      --ckpt /home/alex/noir_ml/global/ml-decon/checkpoints_cond_diffusion_npy/best.pt \
-      --data-dir /home/alex/noir_ml/global/ml-decon/data/m31bK50 \
-      --split val --indices 0:16 --psf-file psf_50_true.fits \
-      --iters 200 --denoise-steps 20 --rho 0.1 --lam 0.01 --eta 1.0
+python admm_diffusion_deconvolve.py \
+    --ckpt /home/alex/noir_ml/global/ml-decon/checkpoints_cond_diffusion_npy/best.pt \
+    --data-dir /home/alex/noir_ml/global/ml-decon/data/m31bK50 \
+    --split val --indices 0:16 --psf-file psf_50_true.fits \
+    --iters 200 --denoise-steps 4 --rho 3.0 --rho-scale 1.0 --lam 0.01 \
+    --eta 0.0 --renoise --t-min 1 --t-max 75 \
+    --n-show 0 --log-every 50 --out-dir admm_fft_best
 """
 
 import argparse
@@ -120,7 +122,7 @@ def t_for_sigma(sigmas: torch.Tensor, sigma: float, t_max: int,
 def diffusion_denoise(model, v_flux, y_z, sigma_z, n_steps, alpha_bar, sigmas,
                       ideal_norm, t_max=75, t_min=1, guidance=1.0,
                       has_null=False, eta=0.0, generator=None,
-                      clamp=(0.0, 1.0)):
+                      clamp=(0.0, 1.0), renoise=False, trace=None):
     """Treat v as a noisy image at normalized-domain noise level sigma_z, map
     that to a timestep, and run the reverse chain from there down to ~0.
 
@@ -132,7 +134,8 @@ def diffusion_denoise(model, v_flux, y_z, sigma_z, n_steps, alpha_bar, sigmas,
     t0 = t_for_sigma(sigmas, sigma_z, t_max, t_min)
     z0 = tweedie_chain(model, z, y_z, t0, n_steps, alpha_bar,
                        guidance=guidance, has_null=has_null, eta=eta,
-                       generator=generator, clamp=clamp)
+                       generator=generator, clamp=clamp, renoise=renoise,
+                       trace=trace)
     return ideal_norm.inverse(z0), t0
 
 
@@ -177,19 +180,86 @@ def main():
                         "near-identity and the prior stops acting. Raising "
                         "this keeps the denoiser contributing to the end.")
     p.add_argument("--eta", type=float, default=0.0,
-                   help="0 = deterministic DDIM chain in the z-update")
+                   help="DDIM stochasticity, MUST be in [0, 1]. 0 = fully "
+                        "deterministic (measured best for photometry: flux "
+                        "0.995 vs 0.972 at eta=1), 1 = full ancestral. Values "
+                        "> 1 are NOT 'more exploration' -- they make "
+                        "1 - abar_next - s^2 negative, which clamps the "
+                        "deterministic direction term to zero and deletes "
+                        "every refinement step in the chain.")
+    p.add_argument("--avg-last", type=int, default=0,
+                   help="average the final K z-iterates into the output "
+                        "(Polyak averaging). The z-update is a STOCHASTIC, "
+                        "non-contractive operator, so the iteration has no "
+                        "fixed point -- it samples a neighbourhood. Measured "
+                        "relative oscillation of the primal residual is ~0.5 "
+                        "with --renoise. Averaging is the standard variance "
+                        "reduction for that and costs no extra model calls. "
+                        "0 = off (use the final iterate). Only the OUTPUT is "
+                        "averaged; the ADMM recursion itself is untouched.")
+    p.add_argument("--renoise", action="store_true",
+                   help="do a PROPER forward diffusion at the chain entry, "
+                        "x_t = sqrt(abar)*z + sqrt(1-abar)*eps, instead of the "
+                        "deterministic rescale. Late in an ADMM run z is much "
+                        "cleaner than sigma(t0), so the model sees a too-clean "
+                        "input, does nothing, and preserves blur. This is the "
+                        "calibrated way to get the regeneration that eta > 1 "
+                        "produces by accident -- strength is set by t0 (see "
+                        "--t-min), not by an unbounded multiplier.")
+    p.add_argument("--eta-end", type=float, default=None,
+                   help="anneal eta linearly from --eta to this over the outer "
+                        "iterations (also must be in [0,1]). Default: constant.")
     p.add_argument("--guidance", type=float, default=1.0)
-    p.add_argument("--nonneg", action="store_true", default=True)
+    p.add_argument("--nonneg", action="store_true", default=False)
     p.add_argument("--weights", choices=["ema", "raw"], default="ema")
     p.add_argument("--no-fits", dest="write_fits", action="store_false",
                    help="skip writing <out-dir>/fits/{recon,truth}/*.fits "
                         "(they are what the external photometry tools consume)")
+    p.add_argument("--n-show", type=int, default=6,
+                   help="rows in patches.png, one per patch. 0 or negative = "
+                        "ALL the patches in --indices.")
     p.add_argument("--crop", type=int, default=4)
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=Path, default=Path("admm_diff_out"))
+    p.add_argument("--trace-chain", type=int, default=0, metavar="N",
+                   help="record per-chain-step diagnostics for the first N "
+                        "outer iterations and every --log-every-th one after, "
+                        "into <out-dir>/chain_trace.csv. The column that "
+                        "matters is dz0_rms: how far the chain's x0 estimate "
+                        "moves at each step, in normalized units. If it decays "
+                        "to ~0 over the chain, the late steps are dead and "
+                        "entry-only --renoise cannot reach them (which is what "
+                        "eta > 1 was compensating for). 1 normalized unit is "
+                        "~14.5 mag at the bright end, so dz0_rms=0.001 is "
+                        "~0.015 mag of movement.")
     args = p.parse_args()
+
+    # eta outside [0,1] over-noises relative to the DDIM derivation. NOTE the
+    # old claim here -- that it "deletes every refinement step" -- was measured
+    # FALSE on 2026-08-11: at t0=75/n_steps=20 the deterministic term is zeroed
+    # in 0/19 steps at eta=1.0, 2/19 at eta=1.5, 6/19 at eta=2.0, and only at
+    # the tail of the chain where the term is already ~0.006. eta=1.5 injects
+    # ~5.6x the total noise of --renoise alone with 17 intact steps. Warn, but
+    # do not mis-describe it. See tweedie_chain's docstring.
+    for nm, v in (("--eta", args.eta), ("--eta-end", args.eta_end)):
+        if v is not None and not (0.0 <= v <= 1.0):
+            print(f"warning: {nm}={v} is outside [0, 1]. DDIM's eta is a "
+                  f"fraction of the ancestral noise, not a gain, so this "
+                  f"over-noises every step and zeroes the deterministic term "
+                  f"in the last few. If it helps, that is evidence the chain "
+                  f"wants more noise than t_max allows (sigma=sqrt(lam/rho) "
+                  f"asks for t=188 at lam=0.01/rho=0.1 and is clamped to "
+                  f"t_max); prefer raising --t-max or --renoise, and use "
+                  f"--trace-chain to see which steps are actually moving.")
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dump the exact config next to the outputs. Without this a directory of
+    # FITS is unattributable after the fact, which has already cost one
+    # unreproducible tuning result.
+    (args.out_dir / "config.json").write_text(json.dumps(
+        {k: (str(v) if isinstance(v, Path) else v)
+         for k, v in vars(args).items()}, indent=2, sort_keys=True))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
@@ -232,6 +302,8 @@ def main():
     truth_np = truth.cpu().numpy()[:, 0]
     peaks = find_peaks(truth_np)
     hist = {"data": [], "prim": [], "dual": [], "conc": []}
+    z_acc, n_acc = None, 0
+    chain_trace = []
 
     for k in range(args.iters):
         # ---- x-update: EXACT Fourier solve (this is the whole point) ----
@@ -241,14 +313,34 @@ def main():
         # ---- z-update: short conditional reverse chain ----
         sigma_z = float(np.sqrt(max(args.lam, 1e-12) / max(rho, 1e-12)))
         z_prev = z
-        eta = args.eta*(1.5 - k/(args.iters))
+        # linear anneal eta -> eta_end over the run. Values above 1 over-noise
+        # every step (see the --eta help and tweedie_chain's docstring); they
+        # do NOT delete the chain's deterministic path except at its tail.
+        eta_k = (args.eta if args.eta_end is None
+                 else args.eta + (args.eta_end - args.eta) * k / max(args.iters - 1, 1))
+        # Trace the first N iterations densely, then sample -- the interesting
+        # contrast is early (iterate still blurry) vs late (iterate converged
+        # and, without --renoise, far cleaner than sigma(t0) implies).
+        tr = ([] if args.trace_chain and
+              (k < args.trace_chain or k % max(args.log_every, 1) == 0)
+              else None)
         z, t_used = diffusion_denoise(
             model, x + u, y_z, sigma_z, args.denoise_steps, alpha_bar, sigmas,
             ideal_norm, t_max=args.t_max, t_min=args.t_min,
-            guidance=args.guidance, has_null=has_null, eta=eta,
-            generator=gen)
+            guidance=args.guidance, has_null=has_null, eta=eta_k,
+            generator=gen, renoise=args.renoise, trace=tr)
+        if tr is not None:
+            for rec in tr:
+                chain_trace.append({"iter": k, "eta": eta_k,
+                                    "sigma_z": sigma_z, **rec})
         if args.nonneg:
             z = z.clamp(min=0.0)
+
+        # Polyak averaging of the OUTPUT only -- the recursion below still uses
+        # the instantaneous z, so the dynamics are unchanged.
+        if args.avg_last > 0 and k >= args.iters - args.avg_last:
+            z_acc = z.clone() if z_acc is None else z_acc + z
+            n_acc += 1
 
         # ---- u-update ----
         u = u + x - z
@@ -267,6 +359,10 @@ def main():
                   f"flux/truth={float(z.sum()/truth.sum()):.3f}", flush=True)
         rho *= args.rho_scale
 
+    if n_acc:
+        z = z_acc / n_acc
+        print(f"[avg] output = mean of the final {n_acc} z-iterates")
+
     # ---- metrics ----
     c0 = args.crop
     crop = np.s_[c0:H - c0, c0:W - c0]
@@ -283,6 +379,31 @@ def main():
         w = csv.DictWriter(fh, fieldnames=list(rows[0])); w.writeheader()
         w.writerows(rows)
     np.save(args.out_dir / f"{args.split}_recon.npy", z_np.astype(np.float32))
+    # convergence history, so the residual behaviour can be analysed instead of
+    # only eyeballed in convergence.png
+    np.savez(args.out_dir / "history.npz",
+             **{k: np.asarray(v, np.float64) for k, v in hist.items()})
+
+    if chain_trace:
+        with open(args.out_dir / "chain_trace.csv", "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(chain_trace[0]))
+            w.writeheader(); w.writerows(chain_trace)
+        # Per-step summary averaged over the traced outer iterations: this is
+        # the H1-vs-H2 read. A dz0_rms profile that decays to ~0 by the end of
+        # the chain means the late steps do nothing and the fix is per-step
+        # noise (eta) rather than more entry noise (t_max).
+        last_it = max(r["iter"] for r in chain_trace)
+        tail = [r for r in chain_trace if r["iter"] == last_it]
+        print(f"\n[chain] per-step movement at outer iter {last_it} "
+              f"(eta={tail[0]['eta']:.2f}, t0={tail[0]['t']}):")
+        print("   step    t   dz0_rms   ~mag   det_coef  noise_coef  clamp_hi%")
+        for r in tail:
+            dz = r["dz0_rms"]
+            print(f"  {r['step']:5d} {r['t']:4d}  {dz:8.5f} "
+                  f"{14.475 * dz if dz == dz else float('nan'):6.3f} "
+                  f"  {r['det_coef']:8.4f}  {r['noise_coef']:9.4f}  "
+                  f"{100 * r['clamp_frac_hi']:8.4f}")
+        print(f"[chain] full trace -> {args.out_dir / 'chain_trace.csv'}")
 
     # ---- FITS, for the external photometry tools ----
     # completeness_analysis.py / final_photometry_table.py glob FITS and pair a
@@ -296,6 +417,16 @@ def main():
         for sub, arr in (("recon", z_np[:, 0]), ("truth", truth_np)):
             d = args.out_dir / "fits" / sub
             d.mkdir(parents=True, exist_ok=True)
+            # DELETE stale patches first. Without this, re-running with fewer
+            # --indices leaves the previous run's extra patch_NN.fits in place
+            # and the photometry tools, which just glob the directory, silently
+            # pool two different configurations into one score.
+            stale = sorted(d.glob("patch_*.fits"))
+            for f in stale:
+                f.unlink()
+            if stale and len(stale) != arr.shape[0]:
+                print(f"[fits] cleared {len(stale)} stale patch files in {d} "
+                      f"(previous run had a different --indices)")
             for i in range(arr.shape[0]):
                 _fits.writeto(d / f"patch_{i:02d}.fits",
                               arr[i].astype(np.float32), overwrite=True)
@@ -318,7 +449,7 @@ def main():
           "definition. The numbers printed here use this script's own peak "
           "list and crop and are NOT comparable to RED's own printout.")
 
-    nshow = min(B, 6)
+    nshow = B if args.n_show <= 0 else min(B, args.n_show)
     fig, ax = plt.subplots(nshow, 3, figsize=(11, 3.6 * nshow), squeeze=False)
     for i2 in range(nshow):
         show(ax[i2, 0], b_np[i2, 0], f"observed (idx {idx[i2]})")
@@ -342,7 +473,8 @@ def main():
         a.set_xlabel("ADMM iteration"); a.grid(alpha=0.3)
     fig.tight_layout(); fig.savefig(args.out_dir / "convergence.png", dpi=130)
     plt.close(fig)
-    print(f"Wrote {args.out_dir}/patches.png, convergence.png, metrics.csv")
+    print(f"Wrote {args.out_dir}/patches.png ({nshow} of {B} patches), "
+          f"convergence.png, metrics.csv")
 
 
 if __name__ == "__main__":
