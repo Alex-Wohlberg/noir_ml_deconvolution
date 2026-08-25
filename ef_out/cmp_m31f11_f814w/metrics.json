@@ -1,0 +1,50 @@
+{
+  "ef (input, blurry)": {
+    "concentration": 0.07463183350171423,
+    "interior_rmse": 1.93308870175244,
+    "edge_rmse": 2.2980594774618934,
+    "floor_frac": 10.491943359375,
+    "flux_ratio": 1.007433838975506,
+    "peak_ratio": 0.13180339170681407,
+    "n_peaks": 141,
+    "phot_median": 0.30257012185402543,
+    "phot_scatter": 0.02147454049046152,
+    "phot_within10": 0.0,
+    "phot_within20": 0.0,
+    "phot_n": 141,
+    "fwd_resid": 0.4342167633284067,
+    "fitted_gain": 1.525324838024789
+  },
+  "l160 (rival deconv)": {
+    "concentration": 0.3034340308953885,
+    "interior_rmse": 0.0,
+    "edge_rmse": 0.0,
+    "floor_frac": 51.53961181640625,
+    "flux_ratio": 1.0,
+    "peak_ratio": 1.0,
+    "n_peaks": 141,
+    "phot_median": 1.0,
+    "phot_scatter": 0.0,
+    "phot_within10": 100.0,
+    "phot_within20": 100.0,
+    "phot_n": 141,
+    "fwd_resid": 0.2512938873448961,
+    "fitted_gain": 1.0460764415139672
+  },
+  "M31f11 f814w model": {
+    "concentration": 0.09325632518679151,
+    "interior_rmse": 1.701343587494571,
+    "edge_rmse": 2.0502650552946493,
+    "floor_frac": 18.41888427734375,
+    "flux_ratio": 1.545066461744697,
+    "peak_ratio": 0.2909089396396423,
+    "n_peaks": 141,
+    "phot_median": 0.6065062363817638,
+    "phot_scatter": 0.056163346438075745,
+    "phot_within10": 0.0,
+    "phot_within20": 1.4184397163120568,
+    "phot_n": 141,
+    "fwd_resid": 0.37936183008474617,
+    "fitted_gain": 1.0225568389454927
+  }
+}

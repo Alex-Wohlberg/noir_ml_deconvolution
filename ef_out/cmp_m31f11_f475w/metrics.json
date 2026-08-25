@@ -1,0 +1,50 @@
+{
+  "ef (input, blurry)": {
+    "concentration": 0.07316123987904505,
+    "interior_rmse": 0.137890282016477,
+    "edge_rmse": 0.16392422712329993,
+    "floor_frac": 6.2835693359375,
+    "flux_ratio": 1.00644648338727,
+    "peak_ratio": 0.13402088854371938,
+    "n_peaks": 141,
+    "phot_median": 0.3097727171227581,
+    "phot_scatter": 0.02422721167030556,
+    "phot_within10": 0.0,
+    "phot_within20": 0.0,
+    "phot_n": 141,
+    "fwd_resid": 0.4121466378126865,
+    "fitted_gain": 1.5253248375483537
+  },
+  "l160 (rival deconv)": {
+    "concentration": 0.29696688068702254,
+    "interior_rmse": 0.0,
+    "edge_rmse": 0.0,
+    "floor_frac": 47.454833984375,
+    "flux_ratio": 1.0,
+    "peak_ratio": 1.0,
+    "n_peaks": 141,
+    "phot_median": 1.0,
+    "phot_scatter": 0.0,
+    "phot_within10": 100.0,
+    "phot_within20": 100.0,
+    "phot_n": 141,
+    "fwd_resid": 0.2385212632840155,
+    "fitted_gain": 1.0460764381925163
+  },
+  "M31f11 f475w model": {
+    "concentration": 0.09240396949981586,
+    "interior_rmse": 0.12944452334212211,
+    "edge_rmse": 0.1577200829778804,
+    "floor_frac": 0.54779052734375,
+    "flux_ratio": 1.5387606721504392,
+    "peak_ratio": 0.24729789211235964,
+    "n_peaks": 141,
+    "phot_median": 0.5369956058226183,
+    "phot_scatter": 0.10071600214043042,
+    "phot_within10": 2.127659574468085,
+    "phot_within20": 5.673758865248227,
+    "phot_n": 141,
+    "fwd_resid": 0.3920877616353165,
+    "fitted_gain": 1.1789325105340904
+  }
+}

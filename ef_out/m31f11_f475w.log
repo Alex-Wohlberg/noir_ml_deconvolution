@@ -1,0 +1,24 @@
+[ckpt] /home/alex/noir_ml/global/ml-decon/checkpoints_cond_m31f11_f475w/best.pt  weights=ema_state  T=1000  net_dtype=float32  identity_frac=0.15  low_t_frac=0.25  p_uncond=0.15
+[norm] *** MISMATCH on 'ideal' *** checkpoint vs /home/alex/noir_ml/global/ml-decon/data/m32_ef_f475w/norm.json: beta 0.026898527517914772 vs None, hi None vs 1.0, hi_s 7.554093663808243 vs None, lo None vs 0.0, lo_s -1.5219434023557414 vs None, median 0.019372006878256798 vs None
+[norm]     the network emits z in the CHECKPOINT's domain. Using the checkpoint's -> the recon decodes correctly, the truth does NOT. Either way the flux ratio is meaningless; retrain or regenerate so they agree.
+[norm] using the checkpoint's dataset_norm
+[fwd]  forward model b = 1 * (psf * x) + sky   (sky mean -0.0364577); flux_ratio is now directly comparable to 1.0
+[rho]  0.1 * 1.05^k -> 1647 at iter 199
+[data] val: 64 patches
+[psf]  /home/alex/noir_ml/mycode/psf_m32_v2_centred.fits
+[admm] iters=200 denoise_steps=4 rho=0.1 lam=0.01 t_max=75
+[t]    trajectory k=0:t=75  k=50:t=51  k=100:t=10  k=150:t=1  k=199:t=1   | clamped at t_max for 37 iters, at t_min for 60
+[t]    sigma(t) at those points k=0:0.1311  k=50:0.0929  k=100:0.0269  k=150:0.0094  k=199:0.0094   (cosine schedule; compare arms on THIS row, not on t)
+  it   0  t= 75 sigma=0.3162  ||Az-b||/||b||=0.3940  prim=2.402e+01 dual=3.273e+00  conc=0.087  flux/truth=0.000
+  it  50  t= 51 sigma=0.0934  ||Az-b||/||b||=0.3946  prim=3.846e+01 dual=2.709e+01  conc=0.089  flux/truth=0.000
+  it 100  t= 10 sigma=0.0276  ||Az-b||/||b||=0.4127  prim=1.713e+01 dual=1.480e+02  conc=0.089  flux/truth=0.000
+  it 150  t=  1 sigma=0.0081  ||Az-b||/||b||=0.4334  prim=6.227e+00 dual=6.547e+02  conc=0.088  flux/truth=0.000
+  it 199  t=  1 sigma=0.0025  ||Az-b||/||b||=0.4900  prim=5.758e+00 dual=6.594e+03  conc=0.089  flux/truth=0.000
+[fits] wrote ef_out/m31f11_f475w/fits/{recon,truth}/patch_*.fits (64 patches each)
+
+[result] flux_ratio=2869047996985314731587939598336.0000  rmse=4.4584e+62
+[result] concentration=0.089   (truth 0.923)
+[result] interior rmse=17414525212075735503601664.0000
+[result] pixels at the zero floor: 0.63%   (truth 86.73% -- MATCH this, do not minimize it; see solver_metrics.floor_frac)
+[note] for a like-for-like comparison against the sampler and RED, run compare_solvers.py -- it scores every method with one metric definition. The numbers printed here use this script's own peak list and crop and are NOT comparable to RED's own printout.
+Wrote ef_out/m31f11_f475w/patches.png (64 of 64 patches), convergence.png, metrics.csv

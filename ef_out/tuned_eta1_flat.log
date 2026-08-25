@@ -1,0 +1,25 @@
+[ckpt] /home/alex/noir_ml/global/ml-decon/checkpoints_cond_diffusion_npy_m32/best.pt  weights=ema_state  T=1000  net_dtype=float32  identity_frac=0.15  low_t_frac=0.25  p_uncond=0.15
+[norm] *** MISMATCH on 'ideal' *** checkpoint vs /home/alex/noir_ml/global/ml-decon/data/m32_ef_l160_matched/norm.json: beta 1.0 vs None, hi None vs 1.0, hi_s 6.471901906466363 vs None, lo None vs 0.0, lo_s 0.0 vs None, median 0.0 vs None
+[norm]     the network emits z in the CHECKPOINT's domain. Using the checkpoint's -> the recon decodes correctly, the truth does NOT. Either way the flux ratio is meaningless; retrain or regenerate so they agree.
+[norm] --split-norms: network <- checkpoint dataset_norm, stored patches <- /home/alex/noir_ml/global/ml-decon/data/m32_ef_l160_matched/norm.json
+[norm] conditioning re-encoded into the checkpoint's observed domain: z 1/50/99/100 = -0.0513 0.1265 0.4994 0.7590
+[fwd]  forward model b = 1 * (psf * x) + sky   (sky mean -0.0100977); flux_ratio is now directly comparable to 1.0
+[rho]  0.1 * 1^k -> 0.1 at iter 199
+[data] val: 64 patches
+[psf]  /home/alex/noir_ml/mycode/psf_m32_epsf.fits
+[admm] iters=200 denoise_steps=4 rho=0.1 lam=0.01 t_max=75
+[t]    trajectory k=0:t=75  k=50:t=75  k=100:t=75  k=150:t=75  k=199:t=75   | clamped at t_max for 200 iters, at t_min for 0
+[t]    sigma(t) at those points k=0:0.1311  k=50:0.1311  k=100:0.1311  k=150:0.1311  k=199:0.1311   (cosine schedule; compare arms on THIS row, not on t)
+  it   0  t= 75 sigma=0.3162  ||Az-b||/||b||=0.7957  prim=1.200e+01 dual=1.233e+00  conc=0.243  flux/truth=1.828
+  it  50  t= 75 sigma=0.3162  ||Az-b||/||b||=0.7291  prim=8.601e+00 dual=5.650e-01  conc=0.241  flux/truth=2.034
+  it 100  t= 75 sigma=0.3162  ||Az-b||/||b||=0.7477  prim=7.792e+00 dual=4.652e-01  conc=0.241  flux/truth=1.971
+  it 150  t= 75 sigma=0.3162  ||Az-b||/||b||=0.7260  prim=7.797e+00 dual=4.666e-01  conc=0.239  flux/truth=2.032
+  it 199  t= 75 sigma=0.3162  ||Az-b||/||b||=0.7261  prim=8.608e+00 dual=5.018e-01  conc=0.240  flux/truth=2.026
+[fits] wrote ef_out/tuned_eta1_flat/fits/{recon,truth}/patch_*.fits (64 patches each)
+
+[result] flux_ratio=2.1091  rmse=2.5203e-02
+[result] concentration=0.240   (truth 0.323)
+[result] interior rmse=0.0235
+[result] pixels at the zero floor: 9.61%   (truth 59.17% -- MATCH this, do not minimize it; see solver_metrics.floor_frac)
+[note] for a like-for-like comparison against the sampler and RED, run compare_solvers.py -- it scores every method with one metric definition. The numbers printed here use this script's own peak list and crop and are NOT comparable to RED's own printout.
+Wrote ef_out/tuned_eta1_flat/patches.png (64 of 64 patches), convergence.png, metrics.csv

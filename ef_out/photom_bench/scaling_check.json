@@ -1,0 +1,6 @@
+{
+  "sum_obs_over_sum_truth": 0.3066689100542395,
+  "sum_obs_over_sum_blurred_truth": 0.3066689103751588,
+  "interior_obs_over_blurred_truth": 0.29951930366417423,
+  "interior_rmse_obs_vs_blurred_truth": 0.01050372077610119
+}

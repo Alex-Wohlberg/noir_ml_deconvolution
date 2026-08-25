@@ -1,0 +1,89 @@
+[ckpt] /home/alex/noir_ml/global/ml-decon/checkpoints_cond_m31f11_f814w/checkpoints_cond_m31f11_f814w/best.pt  weights=ema_state  T=1000  net_dtype=float32  identity_frac=0.15  low_t_frac=0.25  p_uncond=0.15
+[norm] *** MISMATCH on 'ideal' *** checkpoint vs /home/alex/noir_ml/global/ml-decon/data/m32_ef_f814w/norm.json: beta 0.3089483380317688 vs None, hi None vs 1.0, hi_s 7.894468097117549 vs None, lo None vs 0.0, lo_s -2.338664670766322 vs None, median 0.15587307512760162 vs None
+[norm]     the network emits z in the CHECKPOINT's domain. Using the checkpoint's -> the recon decodes correctly, the truth does NOT. Either way the flux ratio is meaningless; retrain or regenerate so they agree.
+[norm] using the checkpoint's dataset_norm
+[fwd]  forward model b = 1 * (psf * x) + sky   (sky mean -0.58111); flux_ratio is now directly comparable to 1.0
+[rho]  0.1 * 1.05^k -> 1647 at iter 199
+[data] val: 64 patches
+[psf]  /home/alex/noir_ml/mycode/psf_m32_v2_centred.fits
+[admm] iters=200 denoise_steps=4 rho=0.1 lam=0.01 t_max=75
+[t]    trajectory k=0:t=75  k=50:t=51  k=100:t=10  k=150:t=1  k=199:t=1   | clamped at t_max for 37 iters, at t_min for 60
+[t]    sigma(t) at those points k=0:0.1311  k=50:0.0929  k=100:0.0269  k=150:0.0094  k=199:0.0094   (cosine schedule; compare arms on THIS row, not on t)
+  it   0  t= 75 sigma=0.3162  ||Az-b||/||b||=0.4152  prim=4.787e+02 dual=6.841e+01  conc=0.091  flux/truth=0.000
+  it  50  t= 51 sigma=0.0934  ||Az-b||/||b||=0.4032  prim=4.958e+02 dual=3.375e+02  conc=0.092  flux/truth=0.000
+  it 100  t= 10 sigma=0.0276  ||Az-b||/||b||=0.4525  prim=2.423e+02 dual=2.004e+03  conc=0.092  flux/truth=0.000
+  it 150  t=  1 sigma=0.0081  ||Az-b||/||b||=0.5044  prim=1.056e+02 dual=1.225e+04  conc=0.093  flux/truth=0.000
+  it 199  t=  1 sigma=0.0025  ||Az-b||/||b||=0.5616  prim=9.194e+01 dual=1.037e+05  conc=0.095  flux/truth=0.000
+/home/alex/noir_ml/mycode/admm_diffusion_deconvolve.py:1034: RuntimeWarning: overflow encountered in square
+  "rmse": (float(np.sqrt(np.mean((xf - tf) ** 2)))
+[fits] wrote ef_out/m31f11_f814w/fits/{recon,truth}/patch_*.fits (64 patches each)
+/home/alex/noir_ml/mycode/admm_diffusion_deconvolve.py:1106: RuntimeWarning: overflow encountered in square
+  ((z_np[:, 0][inner] - truth_np[inner]) ** 2).mean()))
+
+[result] flux_ratio=0.0000  rmse=inf
+/home/alex/noir_ml/mycode/cond_sample_npy.py:101: RuntimeWarning: invalid value encountered in scalar divide
+  vals.append(box[2, 2] / box.sum())
+[result] concentration=0.095   (truth nan)
+[result] interior rmse=inf
+[result] pixels at the zero floor: 17.62%   (truth 60.67% -- MATCH this, do not minimize it; see solver_metrics.floor_frac)
+[note] for a like-for-like comparison against the sampler and RED, run compare_solvers.py -- it scores every method with one metric definition. The numbers printed here use this script's own peak list and crop and are NOT comparable to RED's own printout.
+/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/numpy/_core/_methods.py:190: RuntimeWarning: overflow encountered in square
+  x = um.square(x, out=x)
+/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/numpy/_core/_methods.py:188: RuntimeWarning: invalid value encountered in subtract
+  x = um.subtract(arr, arrmean, out=...)
+/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/numpy/_core/_methods.py:201: RuntimeWarning: overflow encountered in reduce
+  ret = umr_sum(x, axis, dtype, out, keepdims=keepdims, where=where)
+/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/scale.py:472: RuntimeWarning: invalid value encountered in multiply
+  return self.linear_width * np.arcsinh(values / self.linear_width)
+Traceback (most recent call last):
+  File "/home/alex/noir_ml/mycode/admm_diffusion_deconvolve.py", line 1305, in <module>
+    main()
+    ~~~~^^
+  File "/home/alex/noir_ml/mycode/admm_diffusion_deconvolve.py", line 1216, in main
+    fig.tight_layout(); fig.savefig(args.out_dir / "patches.png", dpi=130)
+                        ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/figure.py", line 3490, in savefig
+    self.canvas.print_figure(fname, **kwargs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/backend_bases.py", line 2155, in print_figure
+    self.figure.draw(renderer)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/artist.py", line 94, in draw_wrapper
+    result = draw(artist, renderer, *args, **kwargs)
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/artist.py", line 71, in draw_wrapper
+    return draw(artist, renderer)
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/figure.py", line 3257, in draw
+    mimage._draw_list_compositing_images(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        renderer, self, artists, self.suppressComposite)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/image.py", line 134, in _draw_list_compositing_images
+    a.draw(renderer)
+    ~~~~~~^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/artist.py", line 71, in draw_wrapper
+    return draw(artist, renderer)
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/axes/_base.py", line 3181, in draw
+    mimage._draw_list_compositing_images(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        renderer, self, artists, self.get_figure(root=True).suppressComposite)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/image.py", line 134, in _draw_list_compositing_images
+    a.draw(renderer)
+    ~~~~~~^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/artist.py", line 71, in draw_wrapper
+    return draw(artist, renderer)
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/image.py", line 599, in draw
+    im, l, b, trans = self.make_image(
+                      ~~~~~~~~~~~~~~~^
+        renderer, renderer.get_image_magnification())
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/image.py", line 902, in make_image
+    return self._make_image(self._A, bbox, transformed_bbox, clip,
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                            magnification, unsampled=unsampled)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/image.py", line 499, in _make_image
+    output = self.norm(resampled_masked)
+  File "/opt/conda/miniconda3/envs/py313/lib/python3.13/site-packages/matplotlib/colors.py", line 2678, in __call__
+    raise ValueError("Invalid vmin or vmax")
+ValueError: Invalid vmin or vmax
